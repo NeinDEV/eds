@@ -1,0 +1,114 @@
+{
+  "employees": [
+    {
+      "id": "emp_1",
+      "name": "Musoxon Shovkatov",
+      "telegramId": "123456789",
+      "telegramUsername": "musoxon_sh",
+      "startTime": "09:00",
+      "endTime": "18:00",
+      "createdAt": 1780055711788,
+      "salaryRateType": "monthly",
+      "baseSalaryRate": 4500000,
+      "approved": true
+    },
+    {
+      "id": "emp_2",
+      "name": "Otabek Elmurodov",
+      "telegramId": "987654321",
+      "telegramUsername": "otabek_elm",
+      "startTime": "08:00",
+      "endTime": "17:00",
+      "createdAt": 1781351711788,
+      "salaryRateType": "hourly",
+      "baseSalaryRate": 15000,
+      "approved": true
+    },
+    {
+      "id": "emp_3",
+      "name": "Zuhra Karimova",
+      "telegramId": null,
+      "telegramUsername": "zuhra_karim",
+      "startTime": "09:00",
+      "endTime": "18:00",
+      "createdAt": 1782215711788,
+      "salaryRateType": "monthly",
+      "baseSalaryRate": 4000000,
+      "approved": true
+    },
+    {
+      "id": "emp_4",
+      "name": "Jasur Alimov",
+      "telegramId": null,
+      "telegramUsername": null,
+      "startTime": "10:00",
+      "endTime": "19:00",
+      "createdAt": 1782561311788,
+      "salaryRateType": "hourly",
+      "baseSalaryRate": 12000,
+      "approved": false
+    }
+  ],
+  "attendance": [
+    {
+      "id": "emp_1_2026-06-22",
+      "employeeId": "emp_1",
+      "name": "Musoxon Shovkatov",
+      "date": "2026-06-22",
+      "checkIn": 1782532511,
+      "checkOut": 1782564911,
+      "checkInVideoId": "file_note_checkin_1",
+      "checkOutVideoId": "file_note_checkout_1",
+      "workedMinutes": 540,
+      "latenessMinutes": 0,
+      "penaltyAmount": 0,
+      "baseSalary": 150000,
+      "overtimeSalary": 0,
+      "finalSalary": 150000,
+      "isCompleted": true
+    },
+    {
+      "id": "emp_2_2026-06-22",
+      "employeeId": "emp_2",
+      "name": "Otabek Elmurodov",
+      "date": "2026-06-22",
+      "checkIn": 1782533231,
+      "checkOut": 1782564911,
+      "checkInVideoId": "file_note_checkin_2",
+      "checkOutVideoId": "file_note_checkout_2",
+      "workedMinutes": 528,
+      "latenessMinutes": 12,
+      "penaltyAmount": 6000,
+      "baseSalary": 132000,
+      "overtimeSalary": 0,
+      "finalSalary": 126000,
+      "isCompleted": true
+    }
+  ],
+  "penalties": [
+    {
+      "id": "p_1",
+      "employeeId": "emp_2",
+      "date": "2026-06-22",
+      "minutesLate": 12,
+      "amount": 6000,
+      "description": "Ishga 12 daqiqa kechikib keldi (08:12)",
+      "timestamp": 1782561311788,
+      "cleared": false
+    }
+  ],
+  "settings": {
+    "adminIds": [
+      "musoxon_sh",
+      "123456789",
+      "5624377303",
+      "5523761749"
+    ],
+    "botToken": "",
+    "summerRate": 6500,
+    "summerOvertimeRate": 7000,
+    "winterRate": 6500,
+    "winterOvertimeRate": 7000,
+    "latenessPenaltyPerMinute": 1000
+  }
+}

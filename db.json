@@ -1,0 +1,65 @@
+export interface Employee {
+  id: string; // The employee's unique ID (can be Telegram ID or custom string)
+  name: string;
+  telegramId: string | null;
+  telegramUsername: string | null;
+  startTime: string; // "HH:MM", e.g., "09:00"
+  endTime: string; // "HH:MM", e.g., "18:00"
+  startTime2?: string; // "HH:MM", e.g., "22:00"
+  endTime2?: string; // "HH:MM", e.g., "02:00"
+  createdAt: number;
+  salaryRateType: 'hourly' | 'monthly';
+  baseSalaryRate: number; // e.g. 2000000 per month or 15000 per hour
+  approved: boolean; // Approved by admin or not
+}
+
+export interface PenaltyRecord {
+  id: string;
+  employeeId: string;
+  date: string; // YYYY-MM-DD
+  minutesLate: number;
+  amount: number;
+  description: string;
+  timestamp: number;
+  cleared: boolean;
+}
+
+export interface AttendanceRecord {
+  id: string; // employeeId_date
+  employeeId: string;
+  name: string;
+  date: string; // YYYY-MM-DD
+  checkIn: number | null; // Unix timestamp (seconds)
+  checkOut: number | null; // Unix timestamp (seconds)
+  checkInVideoId: string | null; // Telegram video note file_id
+  checkOutVideoId: string | null;
+  workedMinutes: number;
+  latenessMinutes: number;
+  penaltyAmount: number;
+  baseSalary: number;
+  overtimeSalary: number;
+  finalSalary: number;
+  isCompleted: boolean;
+  notes?: string;
+  smenaNumber?: number; // Bir kunda nechanchi smena (1, 2, 3...)
+  longShiftWarnedAt?: number | null;
+  longShiftAdminNotifiedAt?: number | null;
+}
+
+export interface Settings {
+  adminIds: string[]; // Whitelist of admin Telegram IDs
+  botToken: string | null;
+  summerRate: number; // default 6500
+  summerOvertimeRate: number; // default 7000
+  winterRate: number; // default 6500
+  winterOvertimeRate: number; // default 7000
+  latenessPenaltyPerMinute: number; // Latency penalty amount
+}
+
+export interface DashboardStats {
+  totalEmployees: number;
+  todayActiveCount: number;
+  totalPenaltiesThisMonth: number;
+  totalWagesThisMonth: number;
+  latenessWarningCountToday: number;
+}
