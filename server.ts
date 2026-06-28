@@ -1,9 +1,9 @@
 import express from "express";
 import path from "path";
+import fs from "fs";
+import { createServer as createViteServer } from "vite";
 import { Telegraf, Markup } from "telegraf";
 import { fileURLToPath } from "url";
-import pg from "pg";
-const { Pool } = pg;
 import { 
   Employee, 
   AttendanceRecord, 
@@ -12,44 +12,19 @@ import {
   DashboardStats 
 } from "./src/types.js";
 
-// Load .env in development (dotenv is optional; ignore if missing)
-if (process.env.NODE_ENV !== "production") {
-  try {
-    const dotenvModule = await import("dotenv");
-    dotenvModule.default.config({ path: ".env.local" });
-    dotenvModule.default.config(); // fallback to .env
-  } catch {}
-}
-
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json());
 
-// PostgreSQL connection
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
-});
-
-// Initialize DB table on startup
-async function initDb() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS kv_store (
-      key TEXT PRIMARY KEY,
-      value JSONB NOT NULL
-    )
-  `);
-  // Seed default data if not exists
-  const res = await pool.query("SELECT value FROM kv_store WHERE key = 'app_data'");
-  if (res.rows.length === 0) {
-    await pool.query(
-      "INSERT INTO kv_store (key, value) VALUES ('app_data', $1)",
-      [JSON.stringify(DEFAULT_DB)]
-    );
-  }
+// GMT+5 Uzbekistan time helper — Render runs UTC, so we offset by 5 hours
+function nowUZ(): Date {
+  return new Date(Date.now() + 5 * 60 * 60 * 1000);
 }
+
+// File-based Storage DB path (Configurable via Render env for persistent disk)
+const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), "db.json");
 
 // Define Initial Default DB
 interface DatabaseSchema {
@@ -116,14 +91,14 @@ const DEFAULT_DB: DatabaseSchema = {
       employeeId: "emp_1",
       name: "Musoxon Shovkatov",
       date: "2026-06-22",
-      checkIn: Math.floor((Date.now() - 24 * 60 * 60 * 1000) / 1000) - 8 * 3600, // 09:00 AM ayer approx
-      checkOut: Math.floor((Date.now() - 24 * 60 * 60 * 1000) / 1000) + 1 * 3600, // 18:00 PM ayer approx
+      checkIn: Math.floor((Date.now() - 24 * 60 * 60 * 1000) / 1000) - 8 * 3600,
+      checkOut: Math.floor((Date.now() - 24 * 60 * 60 * 1000) / 1000) + 1 * 3600,
       checkInVideoId: "file_note_checkin_1",
       checkOutVideoId: "file_note_checkout_1",
       workedMinutes: 540,
       latenessMinutes: 0,
       penaltyAmount: 0,
-      baseSalary: 150000, // monthly rate pro-rata (4.5M / 30)
+      baseSalary: 150000,
       overtimeSalary: 0,
       finalSalary: 150000,
       isCompleted: true
@@ -133,16 +108,16 @@ const DEFAULT_DB: DatabaseSchema = {
       employeeId: "emp_2",
       name: "Otabek Elmurodov",
       date: "2026-06-22",
-      checkIn: Math.floor((Date.now() - 24 * 60 * 60 * 1000) / 1000) - 7.8 * 3600, // late checkin 08:12
-      checkOut: Math.floor((Date.now() - 24 * 60 * 60 * 1000) / 1000) + 1 * 3600, // checkout 17:00
+      checkIn: Math.floor((Date.now() - 24 * 60 * 60 * 1000) / 1000) - 7.8 * 3600,
+      checkOut: Math.floor((Date.now() - 24 * 60 * 60 * 1000) / 1000) + 1 * 3600,
       checkInVideoId: "file_note_checkin_2",
       checkOutVideoId: "file_note_checkout_2",
       workedMinutes: 528,
       latenessMinutes: 12,
-      penaltyAmount: 6000, // lateness penalty
-      baseSalary: 132000, // 15000 * 8.8 hrs
+      penaltyAmount: 6000,
+      baseSalary: 132000,
       overtimeSalary: 0,
-      finalSalary: 126000, // base - penalty
+      finalSalary: 126000,
       isCompleted: true
     }
   ],
@@ -160,52 +135,45 @@ const DEFAULT_DB: DatabaseSchema = {
   ],
   settings: {
     adminIds: ["musoxon_sh", "123456789", "5624377303", "5523761749"],
-    botToken: "", // empty by default, will space it dynamically
+    botToken: "",
     summerRate: 6500,
-    summerOvertimeRate: 7000,
+    summerOvertimeRate: 7500,
     winterRate: 6500,
-    winterOvertimeRate: 7000,
-    latenessPenaltyPerMinute: 1000 // 1000 UZS/minute late
+    winterOvertimeRate: 7500,
+    latenessPenaltyPerMinute: 1000
   }
 };
 
-// Database utility functions (PostgreSQL)
-// We keep a fast in-memory cache so sync callers still work
-let _dbCache: DatabaseSchema = DEFAULT_DB;
+// In-memory cache layer to minimize database file I/O operations
+let dbMemoryCache: DatabaseSchema | null = null;
 
-async function loadDbFromPg(): Promise<DatabaseSchema> {
-  try {
-    const res = await pool.query("SELECT value FROM kv_store WHERE key = 'app_data'");
-    if (res.rows.length > 0) {
-      _dbCache = res.rows[0].value as DatabaseSchema;
-    }
-    return _dbCache;
-  } catch (error) {
-    console.error("loadDbFromPg Error:", error);
-    return _dbCache;
-  }
-}
-
-async function saveDbToPg(data: DatabaseSchema): Promise<void> {
-  try {
-    _dbCache = data;
-    await pool.query(
-      "INSERT INTO kv_store (key, value) VALUES ('app_data', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-      [JSON.stringify(data)]
-    );
-  } catch (error) {
-    console.error("saveDbToPg Error:", error);
-  }
-}
-
-// Sync wrappers used throughout the code — read from cache, write async
 function readDb(): DatabaseSchema {
-  return _dbCache;
+  if (dbMemoryCache) {
+    return dbMemoryCache;
+  }
+  try {
+    if (!fs.existsSync(DB_PATH)) {
+      fs.writeFileSync(DB_PATH, JSON.stringify(DEFAULT_DB, null, 2), "utf-8");
+      dbMemoryCache = DEFAULT_DB;
+      return DEFAULT_DB;
+    }
+    const data = fs.readFileSync(DB_PATH, "utf-8");
+    dbMemoryCache = JSON.parse(data) as DatabaseSchema;
+    return dbMemoryCache;
+  } catch (error) {
+    console.error("Read DB Error, returning defaults:", error);
+    dbMemoryCache = DEFAULT_DB;
+    return DEFAULT_DB;
+  }
 }
 
 function writeDb(data: DatabaseSchema) {
-  _dbCache = data;
-  saveDbToPg(data).catch(err => console.error("writeDb async error:", err));
+  dbMemoryCache = data;
+  try {
+    fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2), "utf-8");
+  } catch (error) {
+    console.error("Write DB Error:", error);
+  }
 }
 
 function isAdminUser(userId: string | undefined, username: string | undefined): boolean {
@@ -230,7 +198,6 @@ let botErrorDetails = "";
 let botInfo: { username?: string, first_name?: string } | null = null;
 
 async function startTelegramBot(token: string) {
-  // Stop existing bot
   if (activeBot) {
     try {
       console.log("Shutting down active Telegram bot...");
@@ -252,24 +219,22 @@ async function startTelegramBot(token: string) {
     console.log(`Starting Telegram Bot with token [${token.substring(0, 8)}...]`);
     const bot = new Telegraf(token);
     
-    // Test connection first
     const me = await bot.telegram.getMe();
     botInfo = { username: me.username, first_name: me.first_name };
     console.log(`Bot connected successfully: @${me.username}`);
 
-    // Command handling
     bot.start(async (ctx) => {
       const fromUser = ctx.from;
       const tId = fromUser.id.toString();
       const db = readDb();
 
-      // Check if user is an admin
       if (isAdminUser(tId, fromUser.username)) {
         return ctx.replyWithHTML(
           `👋 Assalomu alaykum, <b>Admin</b>! Admin panelga xush kelibsiz.\n\n` +
           `Quyidagi tugmalar orqali kompaniya davomatini va xodimlarini nazorat qilishingiz mumkin:`,
           Markup.inlineKeyboard([
             [Markup.button.callback("📊 Bugungi davomat hisobi", "admin_today_attendance")],
+            [Markup.button.callback("📈 STATISTIKA - Xodimlar maoshi", "admin_overall_stats")],
             [Markup.button.callback("📋 Xodimlar ro'yxati & boshqaruv", "admin_employees_list")],
             [Markup.button.callback("➕ Xodim qo'shish", "admin_add_employee_hint")],
             [Markup.button.callback("🧹 Jarimani tozalash", "admin_clear_penalties")],
@@ -278,11 +243,9 @@ async function startTelegramBot(token: string) {
         );
       }
 
-      // Find if employee is already linked
       const matchedEmployee = db.employees.find(e => e.telegramId === tId || e.telegramUsername?.toLowerCase() === fromUser.username?.toLowerCase());
       
       if (matchedEmployee) {
-        // Link Telegram ID if not set
         if (!matchedEmployee.telegramId) {
           matchedEmployee.telegramId = tId;
         }
@@ -306,7 +269,6 @@ async function startTelegramBot(token: string) {
           }
         });
       } else {
-        // Unidentified guest
         const guestMsg = `Assalomu alaykum! 🖐\n\n` +
           `Tizimda sizning telegram IDingiz (<code>${tId}</code>) yoki Telegram usernamesingiz topilmadi.\n` +
           `Iltimos, Davomat boshqaruv panelida admin sizning profilingizni qo'shganini tekshiring hamda usernameingiz <b>@${fromUser.username || "yo'q"}</b> yoki telegram IDingiz <code>${tId}</code> panelga kiritilganligini so'rang!\n\n` +
@@ -315,11 +277,10 @@ async function startTelegramBot(token: string) {
       }
     });
 
-    // Admin inline action handlers
     bot.action("admin_today_attendance", async (ctx) => {
       try {
         const db = readDb();
-        const todayStr = new Date().toISOString().split("T")[0];
+        const todayStr = nowUZ().toISOString().split("T")[0];
         const todaysAttendance = db.attendance.filter(a => a.date === todayStr);
 
         let msg = `📊 <b>Bugungi davomat hisobi (${todayStr}):</b>\n\n`;
@@ -329,8 +290,9 @@ async function startTelegramBot(token: string) {
           todaysAttendance.forEach((att, idx) => {
             const emp = db.employees.find(e => e.id === att.employeeId);
             const name = emp ? emp.name : att.name;
-            const inTime = att.checkIn ? new Date(att.checkIn * 1000).toTimeString().substring(0, 5) : "--:--";
-            const outTime = att.checkOut ? new Date(att.checkOut * 1000).toTimeString().substring(0, 5) : "--:--";
+            // Display times in UZ timezone (checkIn/Out are UTC unix seconds, add 5h offset)
+            const inTime = att.checkIn ? new Date((att.checkIn + 5 * 3600) * 1000).toISOString().substring(11, 16) : "--:--";
+            const outTime = att.checkOut ? new Date((att.checkOut + 5 * 3600) * 1000).toISOString().substring(11, 16) : "--:--";
             const lateness = att.latenessMinutes > 0 ? ` (⏱ Kechikish: ${att.latenessMinutes} daq)` : "";
             const smena = att.smenaNumber ? ` [Smena ${att.smenaNumber}]` : "";
             
@@ -362,11 +324,10 @@ async function startTelegramBot(token: string) {
             msg += `${idx + 1}. <b>${emp.name}</b> (ID: <code>${emp.id}</code>)\n` +
                    `   Telegram ID: <code>${emp.telegramId || "Yo'q"}</code>\n` +
                    `   Ish vaqti: <b>${emp.startTime}-${emp.endTime}${shift2}</b>\n` +
-                   `   Tarif: ${emp.salaryRateType === "hourly" ? "Soatbay" : "Oylikbay"} (${emp.baseSalaryRate.toLocaleString()} UZS)\n` +
+                   `   Tarif: Soatbay (${(emp.baseSalaryRate || 6500).toLocaleString()} UZS)\n` +
                    `   Holat: ${status}\n\n`;
           });
 
-          // Generate inline delete buttons beneath all the names
           const deleteButtons = db.employees.map(emp => [
             Markup.button.callback(`❌ O'chirish: ${emp.name}`, `admin_delete_${emp.id}`)
           ]);
@@ -456,6 +417,46 @@ async function startTelegramBot(token: string) {
       }
     });
 
+    bot.action("admin_overall_stats", async (ctx) => {
+      try {
+        const db = readDb();
+        const thisMonthStr = nowUZ().toISOString().substring(0, 7); // YYYY-MM
+        
+        let msg = `📈 <b>Xodimlar ish vaqti va oylik hisoboti (${thisMonthStr}):</b>\n\n`;
+        
+        if (db.employees.length === 0) {
+          msg += "Ro'yxatda hech qanday xodim mavjud emas.";
+        } else {
+          db.employees.forEach((emp, idx) => {
+            const empAtt = db.attendance.filter(a => a.employeeId === emp.id && a.date.startsWith(thisMonthStr));
+            const empPen = db.penalties.filter(p => p.employeeId === emp.id && p.date.startsWith(thisMonthStr) && !p.cleared);
+            
+            const daysCount = empAtt.length;
+            const totalMinutes = empAtt.reduce((sum, a) => sum + (a.workedMinutes || 0), 0);
+            const workedHours = Number((totalMinutes / 60).toFixed(1));
+            
+            const totalBase = empAtt.reduce((sum, a) => sum + (a.baseSalary || 0), 0);
+            const totalOvertime = empAtt.reduce((sum, a) => sum + (a.overtimeSalary || 0), 0);
+            const totalPenalty = empPen.reduce((sum, p) => sum + p.amount, 0);
+            const finalWithdrawn = empAtt.reduce((sum, a) => sum + (a.finalSalary || 0), 0);
+            
+            msg += `👤 <b>${idx + 1}. ${emp.name}</b>\n` +
+                   `📅 Ish kunlari: <b>${daysCount} kun</b>\n` +
+                   `⏳ Jami ish vaqti: <b>${workedHours} soat</b>\n` +
+                   `💵 To'langan asosiy: <b>${totalBase.toLocaleString()} UZS</b>\n` +
+                   `➕ Overtime (qo'shimcha): <b>${totalOvertime.toLocaleString()} UZS</b>\n` +
+                   `➖ Jarimalar (kechikish): <b>${totalPenalty.toLocaleString()} UZS</b>\n` +
+                   `💰 Yakuniy sof oylik: <b>${finalWithdrawn.toLocaleString()} UZS</b>\n\n`;
+          });
+        }
+        
+        await ctx.answerCbQuery();
+        await ctx.replyWithHTML(msg);
+      } catch (err) {
+        console.error("Error in admin_overall_stats handler:", err);
+      }
+    });
+
     bot.action("admin_refresh_menu", async (ctx) => {
       try {
         await ctx.answerCbQuery("Menyu yangilandi!");
@@ -464,6 +465,7 @@ async function startTelegramBot(token: string) {
           `Quyidagi tugmalar orqali kompaniya davomatini va xodimlarini nazorat qilishingiz mumkin:`,
           Markup.inlineKeyboard([
             [Markup.button.callback("📊 Bugungi davomat hisobi", "admin_today_attendance")],
+            [Markup.button.callback("📈 STATISTIKA - Xodimlar maoshi", "admin_overall_stats")],
             [Markup.button.callback("📋 Xodimlar ro'yxati & boshqaruv", "admin_employees_list")],
             [Markup.button.callback("➕ Xodim qo'shish", "admin_add_employee_hint")],
             [Markup.button.callback("🧹 Jarimani tozalash", "admin_clear_penalties")],
@@ -475,7 +477,38 @@ async function startTelegramBot(token: string) {
       }
     });
 
-    // Admin add employee /add command
+    bot.command("clear", async (ctx) => {
+      const fromUser = ctx.from;
+      const tId = fromUser.id.toString();
+      
+      if (!isAdminUser(tId, fromUser.username)) {
+        return ctx.reply("Sizda ushbu buyruqni bajarish uchun ruxsat yo'q. Faqat adminlar bazani tozalay oladi!");
+      }
+
+      try {
+        const db = readDb();
+        const currentAdminIds = db.settings.adminIds || [];
+        const currentToken = db.settings.botToken || "";
+        
+        const freshDb: DatabaseSchema = {
+          employees: [],
+          attendance: [],
+          penalties: [],
+          settings: {
+            ...DEFAULT_DB.settings,
+            adminIds: currentAdminIds.length > 0 ? currentAdminIds : DEFAULT_DB.settings.adminIds,
+            botToken: currentToken
+          }
+        };
+
+        writeDb(freshDb);
+        return ctx.reply("🧹 Barcha ma'lumotlar jurnali (xodimlar, davomat qaydlari va jarimalar) muvaffaqiyatli tozalandi!");
+      } catch (err) {
+        console.error("Error in /clear command handler:", err);
+        return ctx.reply("Bazani tozalashda xatolik yuz berdi.");
+      }
+    });
+
     bot.command("add", async (ctx) => {
       const fromUser = ctx.from;
       const tId = fromUser.id.toString();
@@ -484,9 +517,7 @@ async function startTelegramBot(token: string) {
         return ctx.reply("Sizda ushbu buyruqni bajarish uchun ruxsat yo'q. Faqat adminlar xodim qo'sha oladi!");
       }
 
-      // Parse arguments
-      // e.g., /add 5523761749 MUSOXON SHAVKATOV 10:00 18:00 22:00 2:00
-      const argsText = ctx.message.text.substring(5).trim(); // remove "/add "
+      const argsText = ctx.message.text.substring(5).trim();
       if (!argsText) {
         return ctx.replyWithHTML(
           `⚠️ <b>Xodim qo'shish uchun ma'lumotlar yetarli emas!</b>\n\n` +
@@ -515,7 +546,6 @@ async function startTelegramBot(token: string) {
 
       const employeeName = `${firstName} ${lastName}`;
 
-      // Validate times (HH:MM)
       const timeRegex = /^([01]?[0-9]|2[0-3]):[0-5][0-9]$/;
       if (!timeRegex.test(startTime1) || !timeRegex.test(endTime1)) {
         return ctx.reply(`⚠️ Noto'g'ri vaqt formati (masalan HH:MM, 10:00 yoki 18:00 bo'lishi kerak): '${startTime1}' yoki '${endTime1}'`);
@@ -529,13 +559,11 @@ async function startTelegramBot(token: string) {
 
       const db = readDb();
       
-      // Check if employee with telegramId already exists
       const existing = db.employees.find(e => e.telegramId === employeeTelegramId);
       if (existing) {
         return ctx.reply(`⚠️ Ushbu telegram ID-ga ega xodim allaqachon mavjud: ${existing.name}`);
       }
 
-      // Create new Employee object
       const newEmp: Employee = {
         id: `emp_${Date.now()}`,
         name: employeeName,
@@ -546,9 +574,9 @@ async function startTelegramBot(token: string) {
         startTime2: startTime2,
         endTime2: endTime2,
         createdAt: Date.now(),
-        salaryRateType: "monthly", // Default rate type
-        baseSalaryRate: 3500000,   // Default base salary
-        approved: true             // Automatically approved as added by Admin
+        salaryRateType: "hourly",
+        baseSalaryRate: 6500,
+        approved: true
       };
 
       db.employees.push(newEmp);
@@ -568,7 +596,6 @@ async function startTelegramBot(token: string) {
       return ctx.replyWithHTML(successMsg);
     });
 
-    // Helper text handlers
     bot.hears("ℹ️ Maosh va Tariflar", (ctx) => {
       const db = readDb();
       const s = db.settings;
@@ -590,8 +617,7 @@ async function startTelegramBot(token: string) {
         return ctx.reply("Siz ro'yxatdan o'tmagansiz!");
       }
 
-      // Calculate brief statistics
-      const monthStr = new Date().toISOString().substring(0, 7); // YYYY-MM
+      const monthStr = nowUZ().toISOString().substring(0, 7); // YYYY-MM UZ time
       const myAtt = db.attendance.filter(a => a.employeeId === emp.id && a.date.startsWith(monthStr));
       const totalDays = myAtt.length;
       const myPenalties = db.penalties.filter(p => p.employeeId === emp.id && p.date.startsWith(monthStr));
@@ -601,8 +627,8 @@ async function startTelegramBot(token: string) {
       const profileMsg = `👤 <b>Sizning profilingiz:</b>\n\n` +
         `📎 Ism-sharif: <b>${emp.name}</b>\n` +
         `📅 Ish vaqti: <b>${emp.startTime} - ${emp.endTime}</b>\n` +
-        `💰 Tarif turi: <b>${emp.salaryRateType === "hourly" ? "Soatbay" : "Oylikbay"}</b>\n` +
-        `💵 Baza stavka: <b>${emp.baseSalaryRate.toLocaleString()} UZS</b>\n\n` +
+        `💰 Tarif turi: <b>Soatbay</b>\n` +
+        `💵 Baza stavka: <b>${(emp.baseSalaryRate || 6500).toLocaleString()} UZS / soat</b>\n\n` +
         `📊 <b>Shu oydagi natijalaringiz (${monthStr}):</b>\n` +
         `✅ Qatnashgan kunlaringiz: <b>${totalDays} kun</b>\n` +
         `⚠️ Ushbu oydagi jarimalar summasi: <b>${penaltySum.toLocaleString()} UZS</b>\n` +
@@ -611,7 +637,6 @@ async function startTelegramBot(token: string) {
       ctx.replyWithHTML(profileMsg);
     });
 
-    // Handle session state dynamically in memory
     const userSession: Record<string, "waiting_for_checkin_media" | "waiting_for_checkout_media"> = {};
 
     bot.hears("📥 Keldim (Check-In)", (ctx) => {
@@ -626,7 +651,6 @@ async function startTelegramBot(token: string) {
       ctx.reply("Iltimos, ketishingizni tasdiqlash uchun circular video-xabar (kruglyash) yoki rasmingizni yuboring! 📸");
     });
 
-    // Media receiver (Handles Photos and Video Notes)
     bot.on(["video_note", "photo"], async (ctx) => {
       const tId = ctx.from.id.toString();
       const session = userSession[tId];
@@ -640,7 +664,6 @@ async function startTelegramBot(token: string) {
         return ctx.reply("Siz tizimga ruxsat etilmagansiz.");
       }
 
-      // Extract file details
       let fileId = "";
       let isVideoNote = false;
       if (ctx.message && "video_note" in ctx.message && ctx.message.video_note) {
@@ -650,9 +673,9 @@ async function startTelegramBot(token: string) {
         fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
       }
 
-      const todayStr = new Date().toISOString().split("T")[0];
+      // Use UZ time for today's date string
+      const todayStr = nowUZ().toISOString().split("T")[0];
       
-      // Determine Smema/Shift and Record Key
       const recordKeyShift1 = `${emp.id}_${todayStr}_1`;
       const recordKeyShift2 = `${emp.id}_${todayStr}_2`;
       const legacyKey = `${emp.id}_${todayStr}`;
@@ -666,7 +689,6 @@ async function startTelegramBot(token: string) {
       let smenaNumber = 1;
 
       if (session === "waiting_for_checkin_media") {
-        // Find if there is an ongoing uncompleted shift
         let ongoingIndex = db.attendance.findIndex(a => a.employeeId === emp.id && a.date === todayStr && !a.isCompleted);
         if (ongoingIndex === -1 && idxLegacy !== -1 && !db.attendance[idxLegacy].isCompleted) {
           ongoingIndex = idxLegacy;
@@ -677,14 +699,12 @@ async function startTelegramBot(token: string) {
           return ctx.reply("Siz allaqachon kelishingizni (Check-In) qayd etgansiz! Iltimos, avval ketishingizni (Check-Out) qayd eting.");
         }
 
-        // Determine which shift to start
         const r1 = idx1 !== -1 ? db.attendance[idx1] : (idxLegacy !== -1 ? db.attendance[idxLegacy] : null);
 
         if (!r1) {
           targetRecordKey = recordKeyShift1;
           smenaNumber = 1;
         } else {
-          // Shift 1 exists and is completed. Check if Shift 2 is configured.
           if (emp.startTime2 && emp.endTime2) {
             const r2 = idx2 !== -1 ? db.attendance[idx2] : null;
             if (!r2) {
@@ -702,15 +722,16 @@ async function startTelegramBot(token: string) {
 
         targetRecordIndex = db.attendance.findIndex(a => a.id === targetRecordKey);
 
-        // Calculate Lateness based on the specific shift times
-        const now = new Date();
-        const checkInTimeSec = Math.floor(now.getTime() / 1000);
-        
+        // Use UZ time for check-in timestamp and lateness calculation
+        const now = nowUZ();
+        const checkInTimeSec = Math.floor((now.getTime() - 5 * 60 * 60 * 1000) / 1000); // store as real UTC unix
+
         const sTime = (smenaNumber === 2 && emp.startTime2) ? emp.startTime2 : emp.startTime;
         const [startHour, startMin] = sTime.split(":").map(Number);
         
-        const scheduledTime = new Date();
-        scheduledTime.setHours(startHour, startMin, 0, 0);
+        // Build scheduled time in UZ timezone for comparison
+        const scheduledTime = new Date(now);
+        scheduledTime.setUTCHours(startHour, startMin, 0, 0);
 
         let latenessMinutes = 0;
         let penaltyAmount = 0;
@@ -745,15 +766,15 @@ async function startTelegramBot(token: string) {
           db.attendance.push(newRecord);
         }
 
-        // Create Penalty entry if late
         if (latenessMinutes > 0 && penaltyAmount > 0) {
+          const timeDisplayUZ = now.toISOString().substring(11, 16);
           db.penalties.push({
             id: `p_late_${Date.now()}`,
             employeeId: emp.id,
             date: todayStr,
             minutesLate: latenessMinutes,
             amount: penaltyAmount,
-            description: `${smenaNumber}-smenaga ish vaqtidan ${latenessMinutes} daqiqa kechikib keldi (${now.toTimeString().substring(0, 5)})`,
+            description: `${smenaNumber}-smenaga ish vaqtidan ${latenessMinutes} daqiqa kechikib keldi (${timeDisplayUZ})`,
             timestamp: Date.now(),
             cleared: false
           });
@@ -762,7 +783,6 @@ async function startTelegramBot(token: string) {
         writeDb(db);
         userSession[tId] = undefined as any;
 
-        // Forward circular video (video_note) to admins if requested
         if (isVideoNote) {
           const admins = ["5624377303", "5523761749", ...(db.settings.adminIds || [])];
           for (const admin of admins) {
@@ -781,7 +801,7 @@ async function startTelegramBot(token: string) {
           }
         }
 
-        const timeStr = now.toTimeString().substring(0, 5);
+        const timeStr = now.toISOString().substring(11, 16); // HH:MM in UZ time
         let textResponse = `${smenaNumber}-smenaga kelish qayd etildi! ✅\n` +
           `⏰ Vaqt: <b>${timeStr}</b>\n`;
         
@@ -795,7 +815,6 @@ async function startTelegramBot(token: string) {
         return ctx.replyWithHTML(textResponse);
 
       } else if (session === "waiting_for_checkout_media") {
-        // Find if there is an ongoing uncompleted shift
         let ongoingIndex = db.attendance.findIndex(a => a.employeeId === emp.id && a.date === todayStr && !a.isCompleted);
         if (ongoingIndex === -1 && idxLegacy !== -1 && !db.attendance[idxLegacy].isCompleted) {
           ongoingIndex = idxLegacy;
@@ -808,65 +827,35 @@ async function startTelegramBot(token: string) {
 
         const record = db.attendance[ongoingIndex];
         smenaNumber = record.smenaNumber || 1;
-        const now = new Date();
-        const checkOutTimeSec = Math.floor(now.getTime() / 1000);
+
+        // Use UZ time for checkout
+        const now = nowUZ();
+        const checkOutTimeSec = Math.floor((now.getTime() - 5 * 60 * 60 * 1000) / 1000); // store as real UTC unix
         
         record.checkOut = checkOutTimeSec;
         record.checkOutVideoId = fileId;
 
-        // Calculate hours worked
         const diffInSec = checkOutTimeSec - record.checkIn!;
         const workedMinutes = Math.floor(diffInSec / 60);
         record.workedMinutes = workedMinutes;
 
-        // Salary rate calculations
-        const isWinter = [11, 12, 1, 2, 3].includes(now.getMonth() + 1);
-        const normalRate = isWinter ? db.settings.winterRate : db.settings.summerRate;
-        const otRate = isWinter ? db.settings.winterOvertimeRate : db.settings.summerOvertimeRate;
-
-        // Calculate shift duration
-        const sTime = (smenaNumber === 2 && emp.startTime2) ? emp.startTime2 : emp.startTime;
-        const eTime = (smenaNumber === 2 && emp.endTime2) ? emp.endTime2 : emp.endTime;
-
-        const [startH, startM] = sTime.split(":").map(Number);
-        const [endH, endM] = eTime.split(":").map(Number);
-        
-        let shiftDurationMinutes = 0;
-        if (endH * 60 + endM >= startH * 60 + startM) {
-          shiftDurationMinutes = (endH * 60 + endM) - (startH * 60 + startM);
-        } else {
-          // overnight shift
-          shiftDurationMinutes = (1440 - (startH * 60 + startM)) + (endH * 60 + endM);
-        }
+        // Use UZ month for winter/summer rule
+        const uzMonth = now.getUTCMonth() + 1;
+        const isWinterRule = [11, 12, 1, 2, 3].includes(uzMonth);
+        const standardHoursLimit = isWinterRule ? 9 : 10;
+        const totalHours = workedMinutes / 60;
+        const currentNormalRate = isWinterRule ? (db.settings.winterRate || 6500) : (db.settings.summerRate || 6500);
+        const currentOtRate = isWinterRule ? (db.settings.winterOvertimeRate || 7500) : (db.settings.summerOvertimeRate || 7500);
 
         let baseEarned = 0;
         let overtimeEarned = 0;
 
-        if (emp.salaryRateType === "hourly") {
-          const totalHours = workedMinutes / 60;
-          const standardHoursLimit = shiftDurationMinutes / 60;
-          
-          if (totalHours > standardHoursLimit) {
-            baseEarned = standardHoursLimit * emp.baseSalaryRate;
-            const otHours = totalHours - standardHoursLimit;
-            overtimeEarned = otHours * (emp.baseSalaryRate * 1.25);
-          } else {
-            baseEarned = totalHours * emp.baseSalaryRate;
-          }
+        if (totalHours > standardHoursLimit) {
+          baseEarned = standardHoursLimit * currentNormalRate;
+          const otHours = totalHours - standardHoursLimit;
+          overtimeEarned = otHours * currentOtRate;
         } else {
-          // monthly rate
-          // if worker is double shifted, they might receive dailyRate for each smena completely or half.
-          // Let's divide daily rate by 2 if they have double shift configured, to make double smena sum equal to 1 full standard day. 
-          const baseDailyRatio = (emp.startTime2 && emp.endTime2) ? 0.5 : 1.0;
-          const dailyRate = Math.round((emp.baseSalaryRate / 26) * baseDailyRatio);
-          baseEarned = dailyRate;
-
-          // Overtime calculation
-          if (workedMinutes > shiftDurationMinutes + 30) {
-            const otMinutes = workedMinutes - shiftDurationMinutes;
-            const otRatePerMinute = otRate / 60;
-            overtimeEarned = Math.round(otMinutes * otRatePerMinute);
-          }
+          baseEarned = totalHours * currentNormalRate;
         }
 
         record.baseSalary = Math.round(baseEarned);
@@ -880,7 +869,6 @@ async function startTelegramBot(token: string) {
         writeDb(db);
         userSession[tId] = undefined as any;
 
-        // Forward circular video (video_note) to admins if requested
         if (isVideoNote) {
           const admins = ["5624377303", "5523761749", ...(db.settings.adminIds || [])];
           for (const admin of admins) {
@@ -899,17 +887,32 @@ async function startTelegramBot(token: string) {
           }
         }
 
-        const timeStr = now.toTimeString().substring(0, 5);
+        const timeStr = now.toISOString().substring(11, 16); // HH:MM in UZ time
         const workedHrs = Math.floor(workedMinutes / 60);
         const workedMins = workedMinutes % 60;
 
-        const checkoutResponse = `${smenaNumber}-smenadan ketish qayd etildi! 👋\n` +
+        const monthStr = now.toISOString().substring(0, 7); // YYYY-MM in UZ time
+        const myAtt = db.attendance.filter(a => a.employeeId === emp.id && a.date.startsWith(monthStr));
+        const monthDays = myAtt.length;
+        const monthBaseWages = myAtt.reduce((sum, a) => sum + (a.baseSalary || 0), 0);
+        const monthOtWages = myAtt.reduce((sum, a) => sum + (a.overtimeSalary || 0), 0);
+        const monthPenalties = myAtt.reduce((sum, a) => sum + (a.penaltyAmount || 0), 0);
+        const monthNetWages = myAtt.reduce((sum, a) => sum + (a.finalSalary || 0), 0);
+
+        const checkoutResponse = `<b>✅ ${smenaNumber}-smenadan ketish qayd etildi!</b> 👋\n\n` +
+          `📌 <b>BUGUNGI ISH HAQI:</b>\n` +
           `⏰ Ketish vaqti: <b>${timeStr}</b>\n` +
-          `⏳ Ishlangan vaqt: <b>${workedHrs} soat ${workedMins} daqiqa</b>\n\n` +
-          `💵 Smena uchun baza maosh: <b>${record.baseSalary.toLocaleString()} UZS</b>\n` +
-          `➕ Qo'shimcha ish vaqti (overtime): <b>${record.overtimeSalary.toLocaleString()} UZS</b>\n` +
-          `➖ Kechikish uchun jarima: <b>${record.penaltyAmount.toLocaleString()} UZS</b>\n` +
-          `💰 Smena uchun yakuniy oylik: <b>${record.finalSalary.toLocaleString()} UZS</b>`;
+          `⏳ Ishlangan vaqt: <b>${workedHrs} soat ${workedMins} daqiqa</b>\n` +
+          `💵 Baza tarif: <b>${record.baseSalary.toLocaleString()} UZS</b> (${currentNormalRate.toLocaleString()} UZS/soat)\n` +
+          `➕ Overtime: <b>${record.overtimeSalary.toLocaleString()} UZS</b> (${currentOtRate.toLocaleString()} UZS/soat)\n` +
+          `➖ Jarima (kechikish): <b>${record.penaltyAmount.toLocaleString()} UZS</b>\n` +
+          `💰 Bugungi yakuniy sof maosh: <b>${record.finalSalary.toLocaleString()} UZS</b>\n\n` +
+          `📊 <b>SHU OYDAGI KO'RSATKICHLARINGIZ (${monthStr}):</b>\n` +
+          `📅 Ishlangan jami kun: <b>${monthDays} kun</b>\n` +
+          `💳 Jami baza maosh: <b>${monthBaseWages.toLocaleString()} UZS</b>\n` +
+          `➕ Jami overtime: <b>${monthOtWages.toLocaleString()} UZS</b>\n` +
+          `➖ Jami kechikish jarimalari: <b>${monthPenalties.toLocaleString()} UZS</b>\n` +
+          `💸 Jami ishlab topilgan sof maosh: <b>${monthNetWages.toLocaleString()} UZS</b>`;
 
         return ctx.replyWithHTML(checkoutResponse);
       }
@@ -919,7 +922,6 @@ async function startTelegramBot(token: string) {
       console.error(`Telegram Bot encountered error for update:`, err);
     });
 
-    // Launch Telegraf polling
     bot.launch();
     console.log("Telegram Bot fully polled & launched gracefully!");
     activeBot = bot;
@@ -933,26 +935,39 @@ async function startTelegramBot(token: string) {
   }
 }
 
-// Bot is started inside runServer() after DB loads — see below
+// Auto-run bot on startup if token is ready in persist or environment variables
+const db = readDb();
+const initialSettings = db.settings;
+const botTokenFromEnv = process.env.TELEGRAM_BOT_TOKEN;
+
+if (botTokenFromEnv && initialSettings.botToken !== botTokenFromEnv) {
+  initialSettings.botToken = botTokenFromEnv;
+  db.settings.botToken = botTokenFromEnv;
+  writeDb(db);
+}
+
+const activeToken = botTokenFromEnv || initialSettings.botToken;
+if (activeToken) {
+  startTelegramBot(activeToken).catch(err => {
+    console.error("Auto startup Bot failed:", err);
+  });
+}
 
 // ----------------------------------------------------
 // REST API ROUTES
 // ----------------------------------------------------
 
-// System Status and Bot stats
 app.get("/api/stats", (req, res) => {
   const db = readDb();
-  const todayStr = new Date().toISOString().split("T")[0];
+  const todayStr = nowUZ().toISOString().split("T")[0];
   const thisMonthStr = todayStr.substring(0, 7);
 
   const totalEmployees = db.employees.length;
   const todayActiveCount = db.attendance.filter(a => a.date === todayStr && a.checkIn).length;
   
-  // penalites filtering
   const thisMonthPenalties = db.penalties.filter(p => p.date.startsWith(thisMonthStr));
   const totalPenaltiesThisMonth = thisMonthPenalties.reduce((sum, p) => sum + p.amount, 0);
 
-  // current month salary accruals
   const thisMonthAtt = db.attendance.filter(a => a.date.startsWith(thisMonthStr));
   const totalWagesThisMonth = thisMonthAtt.reduce((sum, a) => sum + (a.finalSalary || 0), 0);
 
@@ -976,7 +991,6 @@ app.get("/api/stats", (req, res) => {
   });
 });
 
-// Employees list & CRUD
 app.get("/api/employees", (req, res) => {
   const db = readDb();
   res.json(db.employees);
@@ -1001,8 +1015,8 @@ app.post("/api/employees", (req, res) => {
     startTime: empInput.startTime,
     endTime: empInput.endTime,
     createdAt: empInput.createdAt || Date.now(),
-    salaryRateType: empInput.salaryRateType || "monthly",
-    baseSalaryRate: Number(empInput.baseSalaryRate || 0),
+    salaryRateType: empInput.salaryRateType || "hourly",
+    baseSalaryRate: Number(empInput.baseSalaryRate || 6500),
     approved: empInput.approved !== undefined ? empInput.approved : true
   };
 
@@ -1026,7 +1040,6 @@ app.delete("/api/employees/:id", (req, res) => {
   res.json({ success: true });
 });
 
-// Attendance listing & Manual records correction
 app.get("/api/attendance", (req, res) => {
   const db = readDb();
   res.json(db.attendance);
@@ -1048,7 +1061,6 @@ app.post("/api/attendance/manual", (req, res) => {
   const recordId = `${input.employeeId}_${input.date}`;
   const existingIdx = db.attendance.findIndex(a => a.id === recordId);
 
-  // Parsed times can be standard strings like "09:00" converted relative to that day Date
   const dateBase = new Date(input.date);
   const [inH, inM] = input.checkIn.split(":").map(Number);
   const checkInSec = Math.floor(new Date(dateBase.setHours(inH, inM, 0)).getTime() / 1000);
@@ -1061,7 +1073,6 @@ app.post("/api/attendance/manual", (req, res) => {
     workedMinutes = Math.floor((checkOutSec - checkInSec) / 60);
   }
 
-  // Lateness check
   const [startH, startM] = emp.startTime.split(":").map(Number);
   const scheduledTime = new Date(dateBase);
   scheduledTime.setHours(startH, startM, 0);
@@ -1075,9 +1086,7 @@ app.post("/api/attendance/manual", (req, res) => {
     penaltyAmount = latenessMinutes * db.settings.latenessPenaltyPerMinute;
   }
 
-  // Rates
   const isWinter = [11, 12, 1, 2, 3].includes(new Date(input.date).getMonth() + 1);
-  const otRate = isWinter ? db.settings.winterOvertimeRate : db.settings.summerOvertimeRate;
   const [empStartH, empStartM] = emp.startTime.split(":").map(Number);
   const [empEndH, empEndM] = emp.endTime.split(":").map(Number);
   const shiftDurationMinutes = (empEndH * 60 + empEndM) - (empStartH * 60 + empStartM);
@@ -1086,24 +1095,18 @@ app.post("/api/attendance/manual", (req, res) => {
   let overtimeSalary = 0;
 
   if (checkOutSec) {
-    if (emp.salaryRateType === "hourly") {
-      const totalHours = workedMinutes / 60;
-      const standardHoursLimit = shiftDurationMinutes / 60;
-      if (totalHours > standardHoursLimit) {
-        baseSalary = standardHoursLimit * emp.baseSalaryRate;
-        const otHours = totalHours - standardHoursLimit;
-        overtimeSalary = otHours * (emp.baseSalaryRate * 1.25);
-      } else {
-        baseSalary = totalHours * emp.baseSalaryRate;
-      }
+    const isWinterRule = [11, 12, 1, 2, 3].includes(new Date(input.date).getMonth() + 1);
+    const standardHoursLimit = isWinterRule ? 9 : 10;
+    const totalHours = workedMinutes / 60;
+    const currentNormalRate = isWinterRule ? (db.settings.winterRate || 6500) : (db.settings.summerRate || 6500);
+    const currentOtRate = isWinterRule ? (db.settings.winterOvertimeRate || 7500) : (db.settings.summerOvertimeRate || 7500);
+
+    if (totalHours > standardHoursLimit) {
+      baseSalary = standardHoursLimit * currentNormalRate;
+      const otHours = totalHours - standardHoursLimit;
+      overtimeSalary = otHours * currentOtRate;
     } else {
-      // Monthly
-      const dailyRate = Math.round(emp.baseSalaryRate / 26);
-      baseSalary = dailyRate;
-      if (workedMinutes > shiftDurationMinutes) {
-        const otMinutes = workedMinutes - shiftDurationMinutes;
-        overtimeSalary = Math.round(otMinutes * (otRate / 60));
-      }
+      baseSalary = totalHours * currentNormalRate;
     }
   }
 
@@ -1138,7 +1141,6 @@ app.post("/api/attendance/manual", (req, res) => {
   res.json(payload);
 });
 
-// Penalties list & creation
 app.get("/api/penalties", (req, res) => {
   const db = readDb();
   res.json(db.penalties);
@@ -1155,7 +1157,7 @@ app.post("/api/penalties", (req, res) => {
   const newPenalty: PenaltyRecord = {
     id: `p_${Date.now()}`,
     employeeId: p.employeeId,
-    date: p.date || new Date().toISOString().split("T")[0],
+    date: p.date || nowUZ().toISOString().split("T")[0],
     minutesLate: Number(p.minutesLate || 0),
     amount: Number(p.amount),
     description: p.description || "Ushbu jarima admin tomonidan yozildi",
@@ -1180,7 +1182,6 @@ app.post("/api/penalties/clear/:id", (req, res) => {
   res.status(404).json({ error: "Jarima topilmadi" });
 });
 
-// Settings operations
 app.get("/api/settings", (req, res) => {
   const db = readDb();
   res.json(db.settings);
@@ -1198,7 +1199,6 @@ app.post("/api/settings", async (req, res) => {
   
   writeDb(db);
 
-  // Restart Telegram Bot if Token changes
   if (newSet.botToken !== oldToken) {
     console.log("Bot token changed. Auto reloading bot runtime...");
     await startTelegramBot(newSet.botToken || "");
@@ -1224,33 +1224,7 @@ app.post("/api/settings/test-token", async (req, res) => {
 
 // Serve frontend assets in production / fallback to Vite in dev
 async function runServer() {
-  // Initialize PostgreSQL and load data into cache before anything else
-  await initDb();
-  await loadDbFromPg();
-  console.log("Database initialized and loaded.");
-
-  // Auto-start bot after DB is loaded
-  // Priority: BOT_TOKEN env var > token saved in DB
-  const _envToken = process.env.BOT_TOKEN || "";
-  const _savedToken = readDb().settings.botToken || "";
-  const _startToken = _envToken || _savedToken;
-  if (_envToken && _envToken !== _savedToken) {
-    // Persist env token into DB so UI reflects it
-    const _db = readDb();
-    _db.settings.botToken = _envToken;
-    writeDb(_db);
-  }
-  if (_startToken) {
-    startTelegramBot(_startToken).catch(err => {
-      console.error("Auto startup Bot failed:", err);
-    });
-  } else {
-    console.log("No BOT_TOKEN set. Add BOT_TOKEN env var in Render to start the bot.");
-  }
-
   if (process.env.NODE_ENV !== "production") {
-    // Lazily import vite only in development so it does not crash in production
-    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa"
@@ -1259,14 +1233,37 @@ async function runServer() {
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get("*", (_req, res) => {
+    app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on port ${PORT}`);
+  const server = app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server fully assembled and running on: http://localhost:${PORT}`);
   });
+
+  server.on("error", (err: NodeJS.ErrnoException) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`Port ${PORT} is already in use. Set a different PORT env var.`);
+    } else {
+      console.error("Server error:", err);
+    }
+    process.exit(1);
+  });
+
+  // Graceful shutdown (important on Render — SIGTERM is sent before container stops)
+  const shutdown = async () => {
+    console.log("Shutting down gracefully...");
+    if (activeBot) {
+      try { await activeBot.stop("SIGTERM"); } catch {}
+    }
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 5000);
+  };
+  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", shutdown);
 }
 
 runServer();
+ENDOFFILE
+echo "done"
