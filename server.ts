@@ -1,8 +1,9 @@
 import express from "express";
 import path from "path";
-import fs from "fs";
 import { Telegraf, Markup } from "telegraf";
 import { fileURLToPath } from "url";
+import pg from "pg";
+const { Pool } = pg;
 import { 
   Employee, 
   AttendanceRecord, 
@@ -26,10 +27,29 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
 
 app.use(express.json());
 
-// File-based Storage DB path
-// On Render, set DATA_DIR env var to a persistent disk mount path (e.g. /data)
-const DATA_DIR = process.env.DATA_DIR || process.cwd();
-const DB_PATH = path.join(DATA_DIR, "db.json");
+// PostgreSQL connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+});
+
+// Initialize DB table on startup
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS kv_store (
+      key TEXT PRIMARY KEY,
+      value JSONB NOT NULL
+    )
+  `);
+  // Seed default data if not exists
+  const res = await pool.query("SELECT value FROM kv_store WHERE key = 'app_data'");
+  if (res.rows.length === 0) {
+    await pool.query(
+      "INSERT INTO kv_store (key, value) VALUES ('app_data', $1)",
+      [JSON.stringify(DEFAULT_DB)]
+    );
+  }
+}
 
 // Define Initial Default DB
 interface DatabaseSchema {
@@ -149,27 +169,43 @@ const DEFAULT_DB: DatabaseSchema = {
   }
 };
 
-// Database utility functions
-function readDb(): DatabaseSchema {
+// Database utility functions (PostgreSQL)
+// We keep a fast in-memory cache so sync callers still work
+let _dbCache: DatabaseSchema = DEFAULT_DB;
+
+async function loadDbFromPg(): Promise<DatabaseSchema> {
   try {
-    if (!fs.existsSync(DB_PATH)) {
-      fs.writeFileSync(DB_PATH, JSON.stringify(DEFAULT_DB, null, 2), "utf-8");
-      return DEFAULT_DB;
+    const res = await pool.query("SELECT value FROM kv_store WHERE key = 'app_data'");
+    if (res.rows.length > 0) {
+      _dbCache = res.rows[0].value as DatabaseSchema;
     }
-    const data = fs.readFileSync(DB_PATH, "utf-8");
-    return JSON.parse(data) as DatabaseSchema;
+    return _dbCache;
   } catch (error) {
-    console.error("Read DB Error, returning defaults:", error);
-    return DEFAULT_DB;
+    console.error("loadDbFromPg Error:", error);
+    return _dbCache;
   }
 }
 
-function writeDb(data: DatabaseSchema) {
+async function saveDbToPg(data: DatabaseSchema): Promise<void> {
   try {
-    fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2), "utf-8");
+    _dbCache = data;
+    await pool.query(
+      "INSERT INTO kv_store (key, value) VALUES ('app_data', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+      [JSON.stringify(data)]
+    );
   } catch (error) {
-    console.error("Write DB Error:", error);
+    console.error("saveDbToPg Error:", error);
   }
+}
+
+// Sync wrappers used throughout the code — read from cache, write async
+function readDb(): DatabaseSchema {
+  return _dbCache;
+}
+
+function writeDb(data: DatabaseSchema) {
+  _dbCache = data;
+  saveDbToPg(data).catch(err => console.error("writeDb async error:", err));
 }
 
 function isAdminUser(userId: string | undefined, username: string | undefined): boolean {
@@ -897,13 +933,7 @@ async function startTelegramBot(token: string) {
   }
 }
 
-// Auto-run bot on startup if token is ready in persist
-const initialSettings = readDb().settings;
-if (initialSettings.botToken) {
-  startTelegramBot(initialSettings.botToken).catch(err => {
-    console.error("Auto startup Bot failed:", err);
-  });
-}
+// Bot is started inside runServer() after DB loads — see below
 
 // ----------------------------------------------------
 // REST API ROUTES
@@ -1194,6 +1224,30 @@ app.post("/api/settings/test-token", async (req, res) => {
 
 // Serve frontend assets in production / fallback to Vite in dev
 async function runServer() {
+  // Initialize PostgreSQL and load data into cache before anything else
+  await initDb();
+  await loadDbFromPg();
+  console.log("Database initialized and loaded.");
+
+  // Auto-start bot after DB is loaded
+  // Priority: BOT_TOKEN env var > token saved in DB
+  const _envToken = process.env.BOT_TOKEN || "";
+  const _savedToken = readDb().settings.botToken || "";
+  const _startToken = _envToken || _savedToken;
+  if (_envToken && _envToken !== _savedToken) {
+    // Persist env token into DB so UI reflects it
+    const _db = readDb();
+    _db.settings.botToken = _envToken;
+    writeDb(_db);
+  }
+  if (_startToken) {
+    startTelegramBot(_startToken).catch(err => {
+      console.error("Auto startup Bot failed:", err);
+    });
+  } else {
+    console.log("No BOT_TOKEN set. Add BOT_TOKEN env var in Render to start the bot.");
+  }
+
   if (process.env.NODE_ENV !== "production") {
     // Lazily import vite only in development so it does not crash in production
     const { createServer: createViteServer } = await import("vite");
@@ -1216,6 +1270,3 @@ async function runServer() {
 }
 
 runServer();
-
-
-
