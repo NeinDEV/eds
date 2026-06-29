@@ -1265,5 +1265,3 @@ async function runServer() {
 }
 
 runServer();
-ENDOFFILE
-echo "done"
