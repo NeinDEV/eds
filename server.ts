@@ -51,6 +51,11 @@ async function initDb() {
       id TEXT PRIMARY KEY DEFAULT 'main',
       data JSONB NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS user_sessions (
+      telegram_id TEXT PRIMARY KEY,
+      state TEXT NOT NULL,
+      updated_at BIGINT NOT NULL
+    );
   `);
 
   // Insert default settings if not present
@@ -134,6 +139,23 @@ async function saveSettings(s: Settings) {
     "INSERT INTO settings (id, data) VALUES ('main', $1) ON CONFLICT (id) DO UPDATE SET data = $1",
     [s]
   );
+}
+
+// ---- DB-backed session helpers (replaces in-memory userSession) ----
+async function setSession(telegramId: string, state: string) {
+  await pool.query(
+    "INSERT INTO user_sessions (telegram_id, state, updated_at) VALUES ($1, $2, $3) ON CONFLICT (telegram_id) DO UPDATE SET state = $2, updated_at = $3",
+    [telegramId, state, Date.now()]
+  );
+}
+
+async function getSession(telegramId: string): Promise<string | null> {
+  const r = await pool.query("SELECT state FROM user_sessions WHERE telegram_id = $1", [telegramId]);
+  return r.rows[0]?.state || null;
+}
+
+async function clearSession(telegramId: string) {
+  await pool.query("DELETE FROM user_sessions WHERE telegram_id = $1", [telegramId]);
 }
 
 function isAdminUser(userId: string | undefined, username: string | undefined, settings: Settings): boolean {
@@ -362,6 +384,7 @@ async function startTelegramBot(token: string) {
       await pool.query("DELETE FROM employees");
       await pool.query("DELETE FROM attendance");
       await pool.query("DELETE FROM penalties");
+      await pool.query("DELETE FROM user_sessions");
       return ctx.reply("🧹 Barcha ma'lumotlar tozalandi!");
     });
 
@@ -439,21 +462,20 @@ async function startTelegramBot(token: string) {
       );
     });
 
-    const userSession: Record<string, "waiting_for_checkin_media" | "waiting_for_checkout_media"> = {};
-
-    bot.hears("📥 Keldim (Check-In)", (ctx) => {
-      userSession[ctx.from.id.toString()] = "waiting_for_checkin_media";
+    // ---- Check-In / Check-Out — now uses DB sessions ----
+    bot.hears("📥 Keldim (Check-In)", async (ctx) => {
+      await setSession(ctx.from.id.toString(), "waiting_for_checkin_media");
       ctx.reply("Circular video yoki rasm yuboring! 📸");
     });
 
-    bot.hears("📤 Ketdim (Check-Out)", (ctx) => {
-      userSession[ctx.from.id.toString()] = "waiting_for_checkout_media";
+    bot.hears("📤 Ketdim (Check-Out)", async (ctx) => {
+      await setSession(ctx.from.id.toString(), "waiting_for_checkout_media");
       ctx.reply("Circular video yoki rasm yuboring! 📸");
     });
 
     bot.on(["video_note", "photo"], async (ctx) => {
       const tId = ctx.from.id.toString();
-      const session = userSession[tId];
+      const session = await getSession(tId);
       if (!session) return ctx.reply("Avval '📥 Keldim' yoki '📤 Ketdim' tugmasini bosing!");
 
       const employees = await getEmployees();
@@ -484,7 +506,7 @@ async function startTelegramBot(token: string) {
       if (session === "waiting_for_checkin_media") {
         const ongoing = attendance.find(a => a.employeeId === emp.id && a.date === todayStr && !a.isCompleted);
         if (ongoing) {
-          userSession[tId] = undefined as any;
+          await clearSession(tId);
           return ctx.reply("Siz allaqachon Check-In qilgansiz! Avval Check-Out qiling.");
         }
 
@@ -498,7 +520,7 @@ async function startTelegramBot(token: string) {
           targetKey = recordKeyShift2;
           smenaNumber = 2;
         } else {
-          userSession[tId] = undefined as any;
+          await clearSession(tId);
           return ctx.reply("Bugungi barcha smenalar yakunlangan! 🚀");
         }
 
@@ -563,7 +585,7 @@ async function startTelegramBot(token: string) {
           }
         }
 
-        userSession[tId] = undefined as any;
+        await clearSession(tId);
         const timeStr = now.toISOString().substring(11, 16);
         let reply = `✅ ${smenaNumber}-smena Check-In qayd etildi!\n⏰ <b>${timeStr}</b>\n`;
         if (latenessMinutes > 0) {
@@ -576,7 +598,7 @@ async function startTelegramBot(token: string) {
       } else if (session === "waiting_for_checkout_media") {
         const ongoing = attendance.find(a => a.employeeId === emp.id && a.date === todayStr && !a.isCompleted);
         if (!ongoing) {
-          userSession[tId] = undefined as any;
+          await clearSession(tId);
           return ctx.reply("Avval '📥 Keldim' belgilang!");
         }
 
@@ -623,7 +645,7 @@ async function startTelegramBot(token: string) {
           }
         }
 
-        userSession[tId] = undefined as any;
+        await clearSession(tId);
         const timeStr = now.toISOString().substring(11, 16);
         const wH = Math.floor(workedMinutes / 60), wM = workedMinutes % 60;
         const monthStr = now.toISOString().substring(0, 7);
@@ -645,11 +667,26 @@ async function startTelegramBot(token: string) {
     });
 
     bot.catch((err) => { console.error("Bot error:", err); });
-    bot.launch();
+
+    // ---- WEBHOOK (production) vs long-poll (local dev) ----
+    const host = process.env.RENDER_EXTERNAL_HOSTNAME;
+    if (host) {
+      const webhookPath = `/webhook/${token}`;
+      const webhookUrl = `https://${host}${webhookPath}`;
+      await bot.telegram.setWebhook(webhookUrl);
+      app.use(webhookPath, bot.webhookCallback(webhookPath));
+      console.log(`Webhook set: ${webhookUrl}`);
+    } else {
+      // Local development — use long polling
+      await bot.telegram.deleteWebhook();
+      bot.launch();
+      console.log("Bot launched in polling mode (local dev).");
+    }
+
     activeBot = bot;
     botStatus = "Online";
     botErrorDetails = "";
-    console.log("Bot launched!");
+    console.log("Bot ready!");
   } catch (error: any) {
     console.error("Failed to start bot:", error);
     botStatus = "Offline";
@@ -843,7 +880,9 @@ async function runServer() {
   const settings = await getSettings();
   const token = process.env.TELEGRAM_BOT_TOKEN || settings.botToken;
   if (token) {
-    startTelegramBot(token).catch(err => console.error("Bot startup failed:", err));
+    // FIX: properly awaited so the server doesn't report Online prematurely
+    try { await startTelegramBot(token); }
+    catch (err) { console.error("Bot startup failed:", err); }
   }
 
   if (process.env.NODE_ENV !== "production") {
