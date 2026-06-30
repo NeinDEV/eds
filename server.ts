@@ -17,9 +17,6 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-// Raw body for /webhook/* — must come BEFORE express.json()
-app.use("/webhook/bot", express.raw({ type: "application/json" }));
-// JSON body for all other API routes
 app.use(express.json());
 
 // GMT+5 Uzbekistan time helper
@@ -671,18 +668,25 @@ async function startTelegramBot(token: string) {
 
     bot.catch((err) => { console.error("Bot error:", err); });
 
-    // ---- WEBHOOK (production) vs long-poll (local dev) ----
     const host = process.env.RENDER_EXTERNAL_HOSTNAME;
     if (host) {
-      // Use a simple fixed path — token in URL causes Express to misparse colons as route params
-      const webhookPath = "/webhook/bot";
+      // Webhook mode for production (Render)
+      const webhookPath = "/tg-webhook";
       const webhookUrl = `https://${host}${webhookPath}`;
       await bot.telegram.setWebhook(webhookUrl);
-      app.post(webhookPath, bot.webhookCallback(webhookPath));
-      console.log(`Webhook set: ${webhookUrl}`);
+      console.log(`Webhook registered: ${webhookUrl}`);
+      // Use bot.launch with webhook config — Telegraf handles body parsing internally
+      bot.launch({
+        webhook: {
+          domain: `https://${host}`,
+          path: webhookPath,
+          app,
+          secretToken: undefined,
+        }
+      });
     } else {
-      // Local development — use long polling
-      await bot.telegram.deleteWebhook();
+      // Local dev — long polling
+      await bot.telegram.deleteWebhook({ drop_pending_updates: true });
       bot.launch();
       console.log("Bot launched in polling mode (local dev).");
     }
