@@ -18,7 +18,7 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
 // Raw body for /webhook/* — must come BEFORE express.json()
-app.use("/webhook", express.raw({ type: "application/json" }));
+app.use("/webhook/bot", express.raw({ type: "application/json" }));
 // JSON body for all other API routes
 app.use(express.json());
 
@@ -674,10 +674,10 @@ async function startTelegramBot(token: string) {
     // ---- WEBHOOK (production) vs long-poll (local dev) ----
     const host = process.env.RENDER_EXTERNAL_HOSTNAME;
     if (host) {
-      const webhookPath = `/webhook/${token}`;
+      // Use a simple fixed path — token in URL causes Express to misparse colons as route params
+      const webhookPath = "/webhook/bot";
       const webhookUrl = `https://${host}${webhookPath}`;
       await bot.telegram.setWebhook(webhookUrl);
-      // Route is pre-registered at top level with raw body parser — just set the callback
       app.post(webhookPath, bot.webhookCallback(webhookPath));
       console.log(`Webhook set: ${webhookUrl}`);
     } else {
