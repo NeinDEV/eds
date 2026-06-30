@@ -17,7 +17,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-// express.json() applied selectively below — NOT on the webhook path
+// Raw body for /webhook/* — must come BEFORE express.json()
+app.use("/webhook", express.raw({ type: "application/json" }));
+// JSON body for all other API routes
+app.use(express.json());
 
 // GMT+5 Uzbekistan time helper
 function nowUZ(): Date {
@@ -674,15 +677,12 @@ async function startTelegramBot(token: string) {
       const webhookPath = `/webhook/${token}`;
       const webhookUrl = `https://${host}${webhookPath}`;
       await bot.telegram.setWebhook(webhookUrl);
-      // MUST be registered BEFORE express.json() so Telegraf gets the raw body
-      app.use(webhookPath, bot.webhookCallback(webhookPath));
-      // Now add express.json() for all other API routes
-      app.use(express.json());
+      // Route is pre-registered at top level with raw body parser — just set the callback
+      app.post(webhookPath, bot.webhookCallback(webhookPath));
       console.log(`Webhook set: ${webhookUrl}`);
     } else {
       // Local development — use long polling
       await bot.telegram.deleteWebhook();
-      app.use(express.json()); // safe to add before launch in polling mode
       bot.launch();
       console.log("Bot launched in polling mode (local dev).");
     }
