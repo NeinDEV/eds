@@ -853,7 +853,8 @@ app.post("/api/settings", async (req, res) => {
     await saveSettings(updated);
     if (updated.botToken !== oldToken) {
       console.log("Token changed, restarting bot...");
-      await startTelegramBot(updated.botToken || "");
+      const activeToken = process.env.TELEGRAM_BOT_TOKEN || updated.botToken || "";
+      await startTelegramBot(activeToken);
     }
     res.json({ success: true, settings: updated });
   } catch { res.status(500).json({ error: "DB error" }); }
@@ -877,10 +878,15 @@ app.post("/api/settings/test-token", async (req, res) => {
 async function runServer() {
   await initDb();
 
-  const settings = await getSettings();
-  const token = process.env.TELEGRAM_BOT_TOKEN || settings.botToken;
-  if (token) {
-    // FIX: properly awaited so the server doesn't report Online prematurely
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) {
+    console.error("❌ TELEGRAM_BOT_TOKEN environment variable is not set!");
+  } else {
+    // Always sync env token into DB so dashboard/settings stay in sync
+    await pool.query(
+      "UPDATE settings SET data = data || $1 WHERE id = 'main'",
+      [JSON.stringify({ botToken: token })]
+    );
     try { await startTelegramBot(token); }
     catch (err) { console.error("Bot startup failed:", err); }
   }
