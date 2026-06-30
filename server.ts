@@ -28,7 +28,7 @@ function nowUZ(): Date {
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL?.includes("render.com") || process.env.NODE_ENV === "production"
-    ? { rejectUnauthorized: false }
+    ? { rejectUnauthorized: false, mode: "verify-full" }
     : false
 });
 
@@ -676,14 +676,31 @@ async function startTelegramBot(token: string) {
       await bot.telegram.setWebhook(webhookUrl);
       console.log(`Webhook registered: ${webhookUrl}`);
       // Use bot.launch with webhook config — Telegraf handles body parsing internally
-      bot.launch({
-        webhook: {
-          domain: `https://${host}`,
-          path: webhookPath,
-          app,
-          secretToken: undefined,
+      // Retry once on 429 rate limit
+      const launchWithRetry = async (retries = 3) => {
+        for (let i = 0; i < retries; i++) {
+          try {
+            await bot.launch({
+              webhook: {
+                domain: `https://${host}`,
+                path: webhookPath,
+                app,
+                secretToken: undefined,
+              }
+            });
+            return;
+          } catch (err: any) {
+            const wait = err?.response?.parameters?.retry_after;
+            if (wait && i < retries - 1) {
+              console.log(`Telegram rate limit hit, retrying in ${wait + 1}s...`);
+              await new Promise(r => setTimeout(r, (wait + 1) * 1000));
+            } else {
+              throw err;
+            }
+          }
         }
-      });
+      };
+      await launchWithRetry();
     } else {
       // Local dev — long polling
       await bot.telegram.deleteWebhook({ drop_pending_updates: true });
